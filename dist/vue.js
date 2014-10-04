@@ -5581,7 +5581,6 @@ var _ = require(2)
  */
 
 function Batcher () {
-  this._preFlush = null
   this.reset()
 }
 
@@ -5621,10 +5620,6 @@ p.push = function (job) {
  */
 
 p.flush = function () {
-  // before flush hook
-  if (this._preFlush) {
-    this._preFlush()
-  }
   // do not cache length because more jobs might be pushed
   // as we run existing jobs
   for (var i = 0; i < this.queue.length; i++) {
@@ -6353,7 +6348,7 @@ function transcludeTemplate (el, options) {
     collectRawContent(el)
     if (options.replace) {
       if (frag.childNodes.length > 1) {
-        transcludeContent(_.toArray(frag.childNodes))
+        transcludeContent(frag)
         return frag
       } else {
         var replacer = frag.firstChild
@@ -6442,7 +6437,7 @@ var concat = [].concat
 function getOutlets (el) {
   return _.isArray(el)
     ? concat.apply([], el.map(getOutlets))
-    : el.nodeType === 1
+    : el.querySelectorAll
       ? _.toArray(el.querySelectorAll('content'))
       : []
 }
@@ -7951,7 +7946,7 @@ module.exports = {
       meta.$value = raw
     }
     // resolve constructor
-    var Ctor = this.Ctor || this.resolveCtor(data)
+    var Ctor = this.Ctor || this.resolveCtor(data, meta)
     var vm = this.vm.$addChild({
       el: this.template.cloneNode(true),
       _linker: this._linker,
@@ -7970,15 +7965,22 @@ module.exports = {
    * components depending on instance data.
    *
    * @param {Object} data
+   * @param {Object} meta
    * @return {Function}
    */
 
-  resolveCtor: function (data) {
+  resolveCtor: function (data, meta) {
+    // create a temporary context object and copy data
+    // and meta properties onto it.
+    // use _.define to avoid accidentally overwriting scope
+    // properties.
     var context = Object.create(this.vm)
-    for (var key in data) {
-      // use _.define to avoid accidentally
-      // overwriting scope properties
+    var key
+    for (key in data) {
       _.define(context, key, data[key])
+    }
+    for (key in meta) {
+      _.define(context, key, meta[key])
     }
     var id = this.ctorGetter.call(context, context)
     var Ctor = this.vm.$options.components[id]
@@ -10462,18 +10464,125 @@ function formatToken (token, vm) {
 
 require.register(54, function (exports, module) {
 var _ = require(2)
-var Batcher = require(15)
-var batcher = new Batcher()
 var transDurationProp = _.transitionProp + 'Duration'
 var animDurationProp = _.animationProp + 'Duration'
 
+var queue = []
+var queued = false
+
 /**
- * Force layout before triggering transitions/animations
+ * Push a job into the transition queue, which is to be
+ * executed on next frame.
+ *
+ * @param {Element} el    - target element
+ * @param {Number} dir    - 1: enter, -1: leave
+ * @param {Function} op   - the actual dom operation
+ * @param {String} cls    - the className to remove when the
+ *                          transition is done.
+ * @param {Function} [cb] - user supplied callback.
  */
 
-batcher._preFlush = function () {
+function push (el, dir, op, cls, cb) {
+  queue.push({
+    el  : el,
+    dir : dir,
+    cb  : cb,
+    cls : cls,
+    op  : op
+  })
+  if (!queued) {
+    queued = true
+    _.nextTick(flush)
+  }
+}
+
+/**
+ * Flush the queue, and do one forced reflow before
+ * triggering transitions.
+ */
+
+function flush () {
   /* jshint unused: false */
   var f = document.documentElement.offsetHeight
+  queue.forEach(run)
+  queue = []
+  queued = false
+}
+
+/**
+ * Run a transition job.
+ *
+ * @param {Object} job
+ */
+
+function run (job) {
+
+  var el = job.el
+  var classList = el.classList
+  var data = el.__v_trans
+  var cls = job.cls
+  var cb = job.cb
+  var op = job.op
+  var transitionType = getTransitionType(el, data, cls)
+
+  if (job.dir > 0) { // ENTER
+    if (transitionType === 1) {
+      // trigger transition by removing enter class
+      classList.remove(cls)
+      // only need to listen for transitionend if there's
+      // a user callback
+      if (cb) setupTransitionCb(_.transitionEndEvent)
+    } else if (transitionType === 2) {
+      // animations are triggered when class is added
+      // so we just listen for animationend to remove it.
+      setupTransitionCb(_.animationEndEvent, function () {
+        classList.remove(cls)
+      })
+    } else {
+      // no transition applicable
+      classList.remove(cls)
+      if (cb) cb()
+    }
+  } else { // LEAVE
+    if (transitionType) {
+      // leave transitions/animations are both triggered
+      // by adding the class, just remove it on end event.
+      var event = transitionType === 1
+        ? _.transitionEndEvent
+        : _.animationEndEvent
+      setupTransitionCb(event, function () {
+        op()
+        classList.remove(cls)
+      })
+    } else {
+      op()
+      classList.remove(cls)
+      if (cb) cb()
+    }
+  }
+
+  /**
+   * Set up a transition end callback, store the callback
+   * on the element's __v_trans data object, so we can
+   * clean it up if another transition is triggered before
+   * the callback is fired.
+   *
+   * @param {String} event
+   * @param {Function} [cleanupFn]
+   */
+
+  function setupTransitionCb (event, cleanupFn) {
+    data.event = event
+    var onEnd = data.callback = function transitionCb (e) {
+      if (e.target === el) {
+        _.off(el, event, onEnd)
+        data.event = data.callback = null
+        if (cleanupFn) cleanupFn()
+        if (cb) cb()
+      }
+    }
+    _.on(el, event, onEnd)
+  }
 }
 
 /**
@@ -10534,86 +10643,13 @@ module.exports = function (el, direction, op, data, cb) {
     classList.remove(leaveClass)
     data.event = data.callback = null
   }
-  var transitionType, onEnd, endEvent
   if (direction > 0) { // enter
-    // Enter Transition
     classList.add(enterClass)
     op()
-    transitionType = getTransitionType(el, data, enterClass)
-    if (transitionType === 1) {
-      batcher.push({
-        run: function () {
-          classList.remove(enterClass)
-        }
-      })
-      // only listen for transition end if user has sent
-      // in a callback
-      if (cb) {
-        endEvent = data.event = _.transitionEndEvent
-        onEnd = data.callback = function transitionCb (e) {
-          if (e.target === el) {
-            _.off(el, endEvent, onEnd)
-            data.event = data.callback = null
-            cb()
-          }
-        }
-        _.on(el, endEvent, onEnd)
-      }
-    } else if (transitionType === 2) {
-      // Enter Animation
-      //
-      // Animations are triggered automatically as the
-      // element is inserted into the DOM, so we just
-      // listen for the animationend event.
-      endEvent = data.event = _.animationEndEvent
-      onEnd = data.callback = function transitionCb (e) {
-        if (e.target === el) {
-          _.off(el, endEvent, onEnd)
-          data.event = data.callback = null
-          classList.remove(enterClass)
-          if (cb) cb()
-        }
-      }
-      _.on(el, endEvent, onEnd)
-    } else {
-      // no transition applicable
-      classList.remove(enterClass)
-      if (cb) cb()
-    }
-
+    push(el, direction, null, enterClass, cb)
   } else { // leave
-
     classList.add(leaveClass)
-    transitionType = getTransitionType(el, data, leaveClass)
-    if (transitionType) {
-      if (transitionType === 1) {
-        classList.remove(leaveClass)
-        batcher.push({
-          run: function () {
-            classList.add(leaveClass)
-          }
-        })
-      }
-      endEvent = data.event = transitionType === 1
-        ? _.transitionEndEvent
-        : _.animationEndEvent
-      onEnd = data.callback = function transitionCb (e) {
-        if (e.target === el) {
-          _.off(el, endEvent, onEnd)
-          data.event = data.callback = null
-          // actually remove node here
-          op()
-          classList.remove(leaveClass)
-          if (cb) cb()
-        }
-      }
-      _.on(el, endEvent, onEnd)
-    } else {
-      op()
-      classList.remove(leaveClass)
-      if (cb) cb()
-    }
-
+    push(el, direction, op, leaveClass, cb)
   }
 }
 });
